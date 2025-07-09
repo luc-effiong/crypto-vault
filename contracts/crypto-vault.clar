@@ -97,3 +97,120 @@
         total-interest
     )
 )
+
+(define-private (check-liquidation (loan-id uint))
+    (let
+        (
+            (loan (unwrap! (map-get? loans {loan-id: loan-id}) ERR-LOAN-NOT-FOUND))
+            (btc-price (unwrap! (get price (map-get? collateral-prices {asset: "BTC"})) ERR-NOT-INITIALIZED))
+            (current-ratio (calculate-collateral-ratio (get collateral-amount loan) (get loan-amount loan) btc-price))
+        )
+        (if (<= current-ratio (var-get liquidation-threshold))
+            (liquidate-position loan-id)
+            (ok true)
+        )
+    )
+)
+
+(define-private (liquidate-position (loan-id uint))
+    (let
+        (
+            (loan (unwrap! (map-get? loans {loan-id: loan-id}) ERR-LOAN-NOT-FOUND))
+            (borrower (get borrower loan))
+        )
+        (begin
+            (map-set loans
+                {loan-id: loan-id}
+                (merge loan {status: "liquidated"})
+            )
+            (map-delete user-loans {user: borrower})
+            (ok true)
+        )
+    )
+)
+
+(define-private (validate-loan-id (loan-id uint))
+    (and 
+        (> loan-id u0)
+        (<= loan-id (var-get total-loans-issued))
+    )
+)
+
+(define-private (is-valid-asset (asset (string-ascii 3)))
+    (is-some (index-of VALID-ASSETS asset))
+)
+
+(define-private (is-valid-price (price uint))
+    (and 
+        (> price u0)
+        (<= price u1000000000000) ;; Reasonable upper limit for price
+    )
+)
+
+(define-private (not-equal-loan-id (id uint))
+    (not (is-eq id id))
+)
+
+;; PUBLIC FUNCTIONS - PLATFORM MANAGEMENT
+
+(define-public (initialize-platform)
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (asserts! (not (var-get platform-initialized)) ERR-ALREADY-INITIALIZED)
+        (var-set platform-initialized true)
+        (ok true)
+    )
+)
+
+;; PUBLIC FUNCTIONS - LENDING OPERATIONS
+
+(define-public (deposit-collateral (amount uint))
+    (begin
+        (asserts! (var-get platform-initialized) ERR-NOT-INITIALIZED)
+        (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+        (var-set total-btc-locked (+ (var-get total-btc-locked) amount))
+        (ok true)
+    )
+)
+
+(define-public (request-loan (collateral uint) (loan-amount uint))
+    (let
+        (
+            (btc-price (unwrap! (get price (map-get? collateral-prices {asset: "BTC"})) ERR-NOT-INITIALIZED))
+            (collateral-value (* collateral btc-price))
+            (required-collateral (* loan-amount (var-get minimum-collateral-ratio)))
+            (loan-id (+ (var-get total-loans-issued) u1))
+        )
+        (begin
+            (asserts! (var-get platform-initialized) ERR-NOT-INITIALIZED)
+            (asserts! (>= collateral-value required-collateral) ERR-INSUFFICIENT-COLLATERAL)
+            
+            (map-set loans
+                {loan-id: loan-id}
+                {
+                    borrower: tx-sender,
+                    collateral-amount: collateral,
+                    loan-amount: loan-amount,
+                    interest-rate: u5, ;; 5% interest rate
+                    start-height: stacks-block-height,
+                    last-interest-calc: stacks-block-height,
+                    status: "active"
+                }
+            )
+            
+            (match (map-get? user-loans {user: tx-sender})
+                existing-loans (map-set user-loans
+                    {user: tx-sender}
+                    {active-loans: (unwrap! (as-max-len? (append (get active-loans existing-loans) loan-id) u10) ERR-INVALID-AMOUNT)}
+                )
+                (map-set user-loans
+                    {user: tx-sender}
+                    {active-loans: (list loan-id)}
+                )
+            )
+            
+            (var-set total-loans-issued (+ (var-get total-loans-issued) u1))
+            (ok loan-id)
+        )
+    )
+)
